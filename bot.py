@@ -581,7 +581,7 @@ async def process_user_message_async(message: types.Message):
     if chat_id not in chat_history:
         chat_history[chat_id] = []
 
-    # Обработка голосовых сообщений (ГС): в ЛС всегда, в группе — только реплаем на бота
+    # Обработка голосовых сообщений (ГС): расшифровка + ответ голосовым
     if message.voice:
         if not is_private_or_business and not await is_reply_to_bot(message):
             return
@@ -611,13 +611,16 @@ async def process_user_message_async(message: types.Message):
             ).strip()
 
             if not transcript_text:
+                await message.reply("Не разобрал твоё бубнение, давай почетче!")
                 await send_voice_reply(message, "Не разобрал твоё бубнение, повтори почетче.")
                 return
 
+            await message.reply(f"<i>Распознано:</i> <b>{html.escape(transcript_text)}</b>", parse_mode="HTML")
             await build_and_send_ai_answer(message, transcript_text, as_voice=True)
             return
         except Exception as e:
             logging.error(f"Ошибка распознавания голосового: {e}")
+            await message.reply("Не разобрал твоё бубнение, давай почетче!")
             await send_voice_reply(message, "Что-то пошло не так с распознаванием голоса, попробуй ещё раз.")
             return
         finally:
