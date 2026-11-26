@@ -581,11 +581,8 @@ async def process_user_message_async(message: types.Message):
     if chat_id not in chat_history:
         chat_history[chat_id] = []
 
-    # Обработка голосовых сообщений (ГС): расшифровка + ответ голосовым
+    # Обработка голосовых сообщений (ГС): расшифровка + ответ голосовым в ЛС и группах
     if message.voice:
-        if not is_private_or_business and not await is_reply_to_bot(message):
-            return
-
         temp_audio_path = f"temp_voice_{message.message_id}_{random.randint(1000, 9999)}.ogg"
         try:
             await bot.send_chat_action(chat_id=chat_id, action="typing")
