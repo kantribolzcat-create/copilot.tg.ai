@@ -581,10 +581,11 @@ async def process_user_message_async(message: types.Message):
     if chat_id not in chat_history:
         chat_history[chat_id] = []
 
-    # Обработка голосовых сообщений (ГС): в ЛС всегда, в группе — только реплаем на бота
+    # Обработка голосовых сообщений (ГС):
+    # расшифровка всегда (в ЛС и группах), а ответ голосовым — в ЛС или по реплаю на бота в группе
     if message.voice:
-        if not is_private_or_business and not await is_reply_to_bot(message):
-            return
+        replied_to_bot = await is_reply_to_bot(message)
+        should_voice_answer = is_private_or_business or replied_to_bot
 
         temp_audio_path = f"temp_voice_{message.message_id}_{random.randint(1000, 9999)}.ogg"
         try:
@@ -612,16 +613,20 @@ async def process_user_message_async(message: types.Message):
 
             if not transcript_text:
                 await message.reply("Не разобрал твоё бубнение, давай почетче!")
-                await send_voice_reply(message, "Не разобрал твоё бубнение, повтори почетче.")
+                if should_voice_answer:
+                    await send_voice_reply(message, "Не разобрал твоё бубнение, повтори почетче.")
                 return
 
             await message.reply(f"<i>Распознано:</i> <b>{html.escape(transcript_text)}</b>", parse_mode="HTML")
-            await build_and_send_ai_answer(message, transcript_text, as_voice=True)
+
+            if should_voice_answer:
+                await build_and_send_ai_answer(message, transcript_text, as_voice=True)
             return
         except Exception as e:
             logging.error(f"Ошибка распознавания голосового: {e}")
             await message.reply("Не разобрал твоё бубнение, давай почетче!")
-            await send_voice_reply(message, "Что-то пошло не так с распознаванием голоса, попробуй ещё раз.")
+            if should_voice_answer:
+                await send_voice_reply(message, "Что-то пошло не так с распознаванием голоса, попробуй ещё раз.")
             return
         finally:
             if os.path.exists(temp_audio_path):
