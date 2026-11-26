@@ -75,6 +75,59 @@ group_message_counters = {}
 chat_last_interaction = {}
 bot_stats = {"requests_handled": 0, "math_solved": 0, "searches_made": 0}
 AUTO_CLEAR_HOURS = 6
+_bot_id_cache: int | None = None
+
+
+async def get_cached_bot_id() -> int:
+    global _bot_id_cache
+    if _bot_id_cache is None:
+        me = await bot.get_me()
+        _bot_id_cache = me.id
+    return _bot_id_cache
+
+
+def prepare_text_for_tts(text: str) -> str:
+    """Очищает разметку и спецсимволы, чтобы озвучка звучала естественно."""
+    cleaned = re.sub(r'```.*?```', ' блок кода ', text, flags=re.DOTALL)
+    cleaned = cleaned.replace("`", "").replace("**", "").replace("*", "")
+    cleaned = html.unescape(cleaned)
+    cleaned = re.sub(r'<[^>]+>', '', cleaned)
+    cleaned = cleaned.replace('"', '').replace("'", "").replace('«', '').replace('»', '')
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned[:1500]
+
+
+async def send_voice_reply(message: types.Message, reply_text: str) -> None:
+    """Озвучивает ответ и отправляет его голосовым сообщением (с откатом на текст при ошибке)."""
+    chat_id = message.chat.id
+    speech_text = prepare_text_for_tts(reply_text)
+    if not speech_text:
+        speech_text = "Хм, сказать вроде и нечего."
+
+    audio_path = f"reply_voice_{message.message_id}_{random.randint(1000, 9999)}.ogg"
+    try:
+        await bot.send_chat_action(chat_id=chat_id, action="record_voice")
+
+        def synth_tts():
+            tts = gTTS(text=speech_text, lang="ru", slow=False)
+            tts.save(audio_path)
+
+        await asyncio.to_thread(synth_tts)
+        audio_file = types.FSInputFile(audio_path)
+        await message.reply_voice(voice=audio_file)
+    except Exception as e:
+        logging.error(f"Ошибка генерации/отправки голосового ответа: {e}")
+        processed_text = clean_text_for_telegram(reply_text)
+        try:
+            await message.reply(processed_text, parse_mode="HTML")
+        except Exception:
+            await message.reply(html.escape(processed_text), parse_mode="HTML")
+    finally:
+        if os.path.exists(audio_path):
+            try:
+                os.remove(audio_path)
+            except OSError:
+                pass
 
 
 # ==========================================
@@ -297,6 +350,13 @@ def extract_audio_info(message: types.Message) -> tuple[str | None, str, str]:
     return None, "", ""
 
 
+async def is_reply_to_bot(message: types.Message) -> bool:
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        return False
+    bot_id = await get_cached_bot_id()
+    return message.reply_to_message.from_user.id == bot_id
+
+
 async def generate_text_reply(chat_id: int, user_prompt_for_history: str) -> str:
     """Добавляет запрос в историю чата и получает ответ через текстовые модели Groq."""
     chat_history[chat_id].append({"role": "user", "content": user_prompt_for_history})
@@ -323,6 +383,74 @@ async def generate_text_reply(chat_id: int, user_prompt_for_history: str) -> str
 
     chat_history[chat_id].append({"role": "assistant", "content": reply_text})
     return reply_text
+
+
+async def build_and_send_ai_answer(message: types.Message, prompt_text: str, as_voice: bool = False) -> None:
+    """Выполняет расчёт/веб-поиск, запрашивает ИИ и отправляет голос или текст."""
+    chat_id = message.chat.id
+    lower_prompt = prompt_text.lower().strip()
+
+    change_style_triggers = ["будь ", "стань ", "веди себя как ", "отвечай как ", "разговаривай как ", "пиши как ", "переключись на "]
+    for trig in change_style_triggers:
+        if lower_prompt.startswith(trig) or f" {trig}" in lower_prompt:
+            chat_custom_instructions[chat_id] = (
+                f"Ты — Copilot AI. ПРИКАЗ ПО ПОВЕДЕНИЮ: {prompt_text}. "
+                "Соблюдай эту роль СТРОГО И БЕЗОГОВОРНО в каждом ответе! Отвечай КРАТКО, ЕМКО И НА РУССКОМ ЯЗЫКЕ."
+            )
+            chat_history[chat_id] = []
+
+    requested_emoji = parse_requested_emoji(prompt_text)
+    if requested_emoji:
+        try:
+            target_msg_id = message.reply_to_message.message_id if message.reply_to_message else message.message_id
+            await bot.set_message_reaction(
+                chat_id=chat_id,
+                message_id=target_msg_id,
+                reaction=[types.ReactionTypeEmoji(emoji=requested_emoji)]
+            )
+        except Exception as e:
+            logging.error(f"Ошибка реакций: {e}")
+
+    math_result = try_solve_math(prompt_text)
+    math_context = ""
+    if math_result:
+        math_context = f"\n\n[ТОЧНЫЙ РЕЗУЛЬТАТ ВЫЧИСЛЕНИЯ НА КАЛЬКУЛЯТОРЕ]: {math_result}"
+
+    explicit_search_triggers = ["найди", "погугли", "ищи", "загугли", "новости", "курс", "погода", "цена", "что", "кто", "где", "когда", "почему", "как", "рил", "правда"]
+    skip_search_words = ["привет", "ку", "здарова", "здорово", "как дела", "хай", "пока", "сброс", "reset", "start", "status"]
+
+    need_web_search = False
+    if math_result:
+        need_web_search = False
+    elif any(w in lower_prompt for w in skip_search_words) and len(prompt_text.split()) < 3:
+        need_web_search = False
+    elif "?" in prompt_text:
+        need_web_search = True
+    elif any(re.search(rf'\b{re.escape(trig)}\b', lower_prompt) for trig in explicit_search_triggers):
+        need_web_search = True
+
+    web_context = ""
+    if need_web_search:
+        await bot.send_chat_action(chat_id=chat_id, action="typing")
+        search_result = await asyncio.to_thread(search_web_real_sync, prompt_text)
+        if search_result:
+            web_context = f"\n\n[СВЕЖИЕ ДАННЫЕ ИЗ СЕТИ]:\n{search_result}"
+
+    await bot.send_chat_action(chat_id=chat_id, action="record_voice" if as_voice else "typing")
+
+    final_user_content = prompt_text + math_context + web_context
+    reply_text = await generate_text_reply(chat_id, final_user_content)
+
+    if as_voice:
+        await send_voice_reply(message, reply_text)
+        return
+
+    processed_text = clean_text_for_telegram(reply_text)
+    try:
+        await message.reply(processed_text, parse_mode="HTML")
+    except Exception as e:
+        logging.error(f"Ошибка отправки HTML: {e}")
+        await message.reply(html.escape(processed_text), parse_mode="HTML")
 
 
 @dp.message(CommandStart())
@@ -370,7 +498,7 @@ async def status_cmd(message: types.Message):
         f"<b>Успешных веб-поисков:</b> {bot_stats['searches_made']}\n"
         f"<b>Решено примеров:</b> {bot_stats['math_solved']}\n"
         f"<b>Всего запросов обработано:</b> {bot_stats['requests_handled']}\n"
-        f"<b>Статус API:</b> Онлайн (Groq + Audio/Whisper + Web + Playwright)\n"
+        f"<b>Статус API:</b> Онлайн (Groq + Voice/Whisper/TTS + Web + Playwright)\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"<i>Всё работает штатно, газлайтинг и ссылки отключены.</i>"
     )
@@ -405,8 +533,8 @@ async def handle_ai_response(message: types.Message):
 async def process_user_message_async(message: types.Message):
     chat_id = message.chat.id
     chat_type = message.chat.type
+    is_private_or_business = (chat_type == "private") or bool(getattr(message, "business_connection_id", None))
 
-    # 1. Сначала берём чистый текст текущего сообщения
     raw_text = message.text or message.caption or ""
     lower_raw = raw_text.lower().strip()
 
@@ -438,18 +566,6 @@ async def process_user_message_async(message: types.Message):
             await message.reply(f"Ошибка озвучки: {e}")
             return
 
-    # 2. Обработка реплаев для обычных текстовых сообщений
-    text_content = raw_text
-    if message.reply_to_message:
-        replied_text = message.reply_to_message.text or message.reply_to_message.caption or ""
-        if replied_text:
-            if text_content:
-                text_content = f"{replied_text}\n{text_content}"
-            else:
-                text_content = replied_text
-
-    lower_text = text_content.lower().strip()
-
     now = time.time()
     bot_stats["requests_handled"] += 1
 
@@ -464,6 +580,64 @@ async def process_user_message_async(message: types.Message):
 
     if chat_id not in chat_history:
         chat_history[chat_id] = []
+
+    # Обработка голосовых сообщений (ГС): в ЛС всегда, в группе — только реплаем на бота
+    if message.voice:
+        if not is_private_or_business and not await is_reply_to_bot(message):
+            return
+
+        temp_audio_path = f"temp_voice_{message.message_id}_{random.randint(1000, 9999)}.ogg"
+        try:
+            await bot.send_chat_action(chat_id=chat_id, action="typing")
+            voice_file = await bot.get_file(message.voice.file_id)
+            voice_bytes = await bot.download_file(voice_file.file_path)
+            raw_voice = voice_bytes.read() if hasattr(voice_bytes, 'read') else voice_bytes.getvalue()
+
+            with open(temp_audio_path, "wb") as f:
+                f.write(raw_voice)
+
+            def transcribe_voice():
+                with open(temp_audio_path, "rb") as audio_file:
+                    return groq_client.audio.transcriptions.create(
+                        model="whisper-large-v3",
+                        file=audio_file,
+                        response_format="text",
+                        language="ru"
+                    )
+
+            transcript_response = await asyncio.to_thread(transcribe_voice)
+            transcript_text = (
+                transcript_response if isinstance(transcript_response, str) else transcript_response.text
+            ).strip()
+
+            if not transcript_text:
+                await send_voice_reply(message, "Не разобрал твоё бубнение, повтори почетче.")
+                return
+
+            await build_and_send_ai_answer(message, transcript_text, as_voice=True)
+            return
+        except Exception as e:
+            logging.error(f"Ошибка распознавания голосового: {e}")
+            await send_voice_reply(message, "Что-то пошло не так с распознаванием голоса, попробуй ещё раз.")
+            return
+        finally:
+            if os.path.exists(temp_audio_path):
+                try:
+                    os.remove(temp_audio_path)
+                except OSError:
+                    pass
+
+    # Обработка реплаев для остальных сообщений
+    text_content = raw_text
+    if message.reply_to_message:
+        replied_text = message.reply_to_message.text or message.reply_to_message.caption or ""
+        if replied_text:
+            if text_content:
+                text_content = f"{replied_text}\n{text_content}"
+            else:
+                text_content = replied_text
+
+    lower_text = text_content.lower().strip()
 
     # Обработка фото (Vision) с бесконечным циклом
     if message.photo:
@@ -547,7 +721,6 @@ async def process_user_message_async(message: types.Message):
     if audio_file_id:
         temp_audio_file_path = f"temp_audio_{message.message_id}_{random.randint(1000, 9999)}{audio_ext}"
         try:
-            # Этап 1: скачиваем и распознаём речь/содержимое через Whisper
             await bot.send_chat_action(chat_id=chat_id, action="typing")
             tg_file = await bot.get_file(audio_file_id)
             audio_bytes_io = await bot.download_file(tg_file.file_path)
@@ -565,9 +738,6 @@ async def process_user_message_async(message: types.Message):
                     )
 
             transcript_response = await asyncio.to_thread(transcribe_audio_file)
-            if os.path.exists(temp_audio_file_path):
-                os.remove(temp_audio_file_path)
-
             transcript_text = (
                 transcript_response if isinstance(transcript_response, str) else transcript_response.text
             ).strip()
@@ -601,7 +771,6 @@ async def process_user_message_async(message: types.Message):
                     f"Запрос пользователя: {user_instruction}"
                 )
 
-            # Этап 2: описание и разбор аудио через текстовую модель ИИ
             await bot.send_chat_action(chat_id=chat_id, action="typing")
             reply_text = await generate_text_reply(chat_id, description_prompt)
             processed_text = clean_text_for_telegram(reply_text)
@@ -619,86 +788,32 @@ async def process_user_message_async(message: types.Message):
             return
         except Exception as e:
             logging.error(f"Ошибка обработки аудиофайла: {e}")
-            if os.path.exists(temp_audio_file_path):
-                os.remove(temp_audio_file_path)
             await message.reply(f"Не удалось обработать аудиофайл: {e}")
             return
-
-    # Обработка голосовых (Whisper)
-    temp_audio_path = None
-    if message.voice:
-        try:
-            await bot.send_chat_action(chat_id=chat_id, action="typing")
-            voice_file = await bot.get_file(message.voice.file_id)
-            voice_bytes = await bot.download_file(voice_file.file_path)
-
-            temp_audio_path = f"temp_voice_{message.message_id}.ogg"
-            with open(temp_audio_path, "wb") as f:
-                f.write(voice_bytes.read())
-
-            def transcribe_voice():
-                with open(temp_audio_path, "rb") as audio_file:
-                    return groq_client.audio.transcriptions.create(
-                        model="whisper-large-v3",
-                        file=audio_file,
-                        response_format="text",
-                        language="ru"
-                    )
-
-            transcript_response = await asyncio.to_thread(transcribe_voice)
-            if temp_audio_path and os.path.exists(temp_audio_path):
-                os.remove(temp_audio_path)
-
-            text_content = transcript_response if isinstance(transcript_response, str) else transcript_response.text
-            await message.reply(f"<i>Распознано:</i> <b>{html.escape(text_content)}</b>", parse_mode="HTML")
-        except Exception as e:
-            logging.error(f"Ошибка распознавания голосового: {e}")
-            if temp_audio_path and os.path.exists(temp_audio_path):
-                os.remove(temp_audio_path)
-            await message.reply("Не разобрал твоё бубнение, давай почетче!")
-            return
-
-    change_style_triggers = ["будь ", "стань ", "веди себя как ", "отвечай как ", "разговаривай как ", "пиши как ", "переключись на "]
-    for trig in change_style_triggers:
-        if lower_text.startswith(trig) or f" {trig}" in lower_text:
-            new_style = text_content
-            chat_custom_instructions[chat_id] = (
-                f"Ты — Copilot AI. ПРИКАЗ ПО ПОВЕДЕНИЮ: {new_style}. "
-                "Соблюдай эту роль СТРОГО И БЕЗОГОВОРНО в каждом ответе! Отвечай КРАТКО, ЕМКО И НА РУССКОМ ЯЗЫКЕ."
-            )
-            chat_history[chat_id] = []
+        finally:
+            if os.path.exists(temp_audio_file_path):
+                try:
+                    os.remove(temp_audio_file_path)
+                except OSError:
+                    pass
 
     should_answer = True
-    if chat_type != "private" and not getattr(message, "business_connection_id", None):
-        if not message.photo:
-            should_answer = False
-            if message.reply_to_message and message.reply_to_message.from_user:
-                if message.reply_to_message.from_user.id == (await bot.get_me()).id:
-                    should_answer = True
-            if f"@{BOT_USERNAME}".lower() in lower_text:
-                should_answer = True
-                text_content = text_content.replace(f"@{BOT_USERNAME}", "").strip()
+    if not is_private_or_business and not message.photo:
+        should_answer = False
+        if await is_reply_to_bot(message):
+            should_answer = True
+        if f"@{BOT_USERNAME}".lower() in lower_text:
+            should_answer = True
+            text_content = text_content.replace(f"@{BOT_USERNAME}", "").strip()
 
-            if not should_answer:
-                group_message_counters[chat_id] = group_message_counters.get(chat_id, 0) + 1
-                if group_message_counters[chat_id] >= 15:
-                    group_message_counters[chat_id] = 0
-                    should_answer = True
+        if not should_answer:
+            group_message_counters[chat_id] = group_message_counters.get(chat_id, 0) + 1
+            if group_message_counters[chat_id] >= 15:
+                group_message_counters[chat_id] = 0
+                should_answer = True
 
     if not should_answer:
         return
-
-    requested_emoji = parse_requested_emoji(text_content)
-    if requested_emoji:
-        try:
-            target_msg_id = message.reply_to_message.message_id if message.reply_to_message else message.message_id
-            await bot.set_message_reaction(
-                chat_id=chat_id,
-                message_id=target_msg_id,
-                reaction=[types.ReactionTypeEmoji(emoji=requested_emoji)]
-            )
-        except Exception as e:
-            logging.error(f"Ошибка реакций: {e}")
 
     # Генерация картинок (Pollinations) — без мусорных текстов на картинке и в подписи
     if any(trig in lower_raw for trig in ["сгенерируй", "нарисуй", "создай картинку", "аватарка", "изображение"]):
@@ -722,44 +837,7 @@ async def process_user_message_async(message: types.Message):
     if not text_content:
         return
 
-    # Проверка на математику (автоматический расчет на калькуляторе)
-    math_result = try_solve_math(text_content)
-    math_context = ""
-    if math_result:
-        math_context = f"\n\n[ТОЧНЫЙ РЕЗУЛЬТАТ ВЫЧИСЛЕНИЯ НА КАЛЬКУЛЯТОРЕ]: {math_result}"
-
-    # Умный веб-поиск
-    explicit_search_triggers = ["найди", "погугли", "ищи", "загугли", "новости", "курс", "погода", "цена", "что", "кто", "где", "когда", "почему", "как", "рил", "правда"]
-    skip_search_words = ["привет", "ку", "здарова", "здорово", "как дела", "хай", "пока", "сброс", "reset", "start", "status"]
-
-    need_web_search = False
-    if math_result:
-        need_web_search = False
-    elif any(w in lower_text for w in skip_search_words) and len(text_content.split()) < 3:
-        need_web_search = False
-    elif "?" in text_content:
-        need_web_search = True
-    elif any(re.search(rf'\b{re.escape(trig)}\b', lower_text) for trig in explicit_search_triggers):
-        need_web_search = True
-
-    web_context = ""
-    if need_web_search:
-        await bot.send_chat_action(chat_id=chat_id, action="typing")
-        search_result = await asyncio.to_thread(search_web_real_sync, text_content)
-        if search_result:
-            web_context = f"\n\n[СВЕЖИЕ ДАННЫЕ ИЗ СЕТИ]:\n{search_result}"
-
-    await bot.send_chat_action(chat_id=chat_id, action="typing")
-
-    final_user_content = text_content + math_context + web_context
-    reply_text = await generate_text_reply(chat_id, final_user_content)
-    processed_text = clean_text_for_telegram(reply_text)
-
-    try:
-        await message.reply(processed_text, parse_mode="HTML")
-    except Exception as e:
-        logging.error(f"Ошибка отправки HTML: {e}")
-        await message.reply(html.escape(processed_text), parse_mode="HTML")
+    await build_and_send_ai_answer(message, text_content, as_voice=False)
 
 
 async def main():
