@@ -350,6 +350,86 @@ def extract_audio_info(message: types.Message) -> tuple[str | None, str, str]:
     return None, "", ""
 
 
+def extract_gif_or_sticker_info(message: types.Message) -> tuple[str | None, str]:
+    """Возвращает (file_id, media_label) для GIF/видео-гиф (animation) или стикеров (в т.ч. фото/видео/анимированных)."""
+    if message.animation:
+        file_id = message.animation.file_id
+        if message.animation.thumbnail:
+            file_id = message.animation.thumbnail.file_id
+        return file_id, "GIF/анимация"
+
+    if message.sticker:
+        file_id = message.sticker.file_id
+        if message.sticker.thumbnail and (message.sticker.is_animated or message.sticker.is_video):
+            file_id = message.sticker.thumbnail.file_id
+        emoji_hint = f" ({message.sticker.emoji})" if message.sticker.emoji else ""
+        return file_id, f"стикер-гиф/стикер{emoji_hint}"
+
+    return None, ""
+
+
+def prepare_jpeg_base64(raw_data: bytes) -> str:
+    """Конвертирует картинку/превью в JPEG до 1024px и возвращает base64."""
+    processed_bytes = raw_data
+    if HAS_PIL:
+        try:
+            img = Image.open(io.BytesIO(raw_data))
+            if img.mode in ("RGBA", "LA", "P"):
+                img = img.convert("RGB")
+            img.thumbnail((1024, 1024))
+            buffer = io.BytesIO()
+            img.save(buffer, format="JPEG", quality=85)
+            processed_bytes = buffer.getvalue()
+        except Exception as img_err:
+            logging.warning(f"Сжатие/конвертация PIL пропущено: {img_err}")
+    return base64.b64encode(processed_bytes).decode("utf-8")
+
+
+async def ask_vision_with_retry(chat_id: int, prompt_text: str, base64_image: str) -> str:
+    """Отправляет изображение в Vision-модели Groq с повторными попытками."""
+    current_time_str = datetime.datetime.now().strftime("%d.%m.%Y (%A), %H:%M")
+    vision_system_prompt = f"ТЕКУЩЕЕ ТОЧНОЕ ВРЕМЯ И ДАТА: {current_time_str}.\n{chat_custom_instructions[chat_id]}"
+
+    vision_messages = [
+        {"role": "system", "content": vision_system_prompt},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt_text},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{base64_image}"
+                    }
+                }
+            ]
+        }
+    ]
+
+    reply_text = None
+    attempt = 1
+    while not reply_text:
+        for model_name in VISION_MODELS:
+            try:
+                response = await asyncio.to_thread(
+                    groq_client.chat.completions.create,
+                    model=model_name,
+                    messages=vision_messages,
+                    max_tokens=1300
+                )
+                if response.choices and response.choices[0].message.content:
+                    reply_text = response.choices[0].message.content
+                    break
+            except Exception as api_err:
+                logging.warning(f"Попытка визуального анализа {attempt}: модель {model_name} занята ({api_err}), ждем...")
+
+        if not reply_text:
+            attempt += 1
+            await asyncio.sleep(5)
+
+    return reply_text
+
+
 async def is_reply_to_bot(message: types.Message) -> bool:
     if not message.reply_to_message or not message.reply_to_message.from_user:
         return False
@@ -498,7 +578,7 @@ async def status_cmd(message: types.Message):
         f"<b>Успешных веб-поисков:</b> {bot_stats['searches_made']}\n"
         f"<b>Решено примеров:</b> {bot_stats['math_solved']}\n"
         f"<b>Всего запросов обработано:</b> {bot_stats['requests_handled']}\n"
-        f"<b>Статус API:</b> Онлайн (Groq + Voice/Whisper/TTS + Web + Playwright)\n"
+        f"<b>Статус API:</b> Онлайн (Groq + Voice/Whisper/TTS + GIF/Vision + Web + Playwright)\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"<i>Всё работает штатно, газлайтинг и ссылки отключены.</i>"
     )
@@ -647,6 +727,34 @@ async def process_user_message_async(message: types.Message):
 
     lower_text = text_content.lower().strip()
 
+    # Обработка гифов (GIF/видео-гиф и стикеров-гиф/фото):
+    # в ЛС — всегда, в группах — только при реплае на сообщение бота
+    gif_file_id, gif_label = extract_gif_or_sticker_info(message)
+    if gif_file_id:
+        if not is_private_or_business and not await is_reply_to_bot(message):
+            return
+
+        await bot.send_chat_action(chat_id=chat_id, action="typing")
+        try:
+            media_file = await bot.get_file(gif_file_id)
+            media_bytes_io = await bot.download_file(media_file.file_path)
+            raw_media = media_bytes_io.read() if hasattr(media_bytes_io, 'read') else media_bytes_io.getvalue()
+            base64_media = prepare_jpeg_base64(raw_media)
+
+            prompt_text = text_content if text_content else (
+                f"Посмотри на этот {gif_label} (кадр/превью), пойми эмоцию, сцену или шутку "
+                "и прокомментируй в своем фирменном саркастичном стиле!"
+            )
+
+            reply_text = await ask_vision_with_retry(chat_id, prompt_text, base64_media)
+            chat_history[chat_id].append({"role": "user", "content": f"[{gif_label}]: {text_content}"})
+            chat_history[chat_id].append({"role": "assistant", "content": reply_text})
+            await message.reply(clean_text_for_telegram(reply_text), parse_mode="HTML")
+        except Exception as e:
+            logging.error(f"Критическая ошибка обработки гифа/стикера: {e}")
+            await message.reply(f"Ошибка обработки гифа: {e}")
+        return
+
     # Обработка фото (Vision) с бесконечным циклом
     if message.photo:
         await bot.send_chat_action(chat_id=chat_id, action="typing")
@@ -658,63 +766,14 @@ async def process_user_message_async(message: types.Message):
             photo_bytes_io = await bot.download_file(photo_file.file_path)
 
             raw_data = photo_bytes_io.read() if hasattr(photo_bytes_io, 'read') else photo_bytes_io.getvalue()
-
-            if HAS_PIL:
-                try:
-                    img = Image.open(io.BytesIO(raw_data))
-                    img.thumbnail((1024, 1024))
-                    buffer = io.BytesIO()
-                    img.save(buffer, format="JPEG", quality=85)
-                    raw_data = buffer.getvalue()
-                except Exception as img_err:
-                    logging.warning(f"Сжатие PIL пропущено: {img_err}")
-
-            base64_image = base64.b64encode(raw_data).decode("utf-8")
+            base64_image = prepare_jpeg_base64(raw_data)
 
             prompt_text = text_content if text_content else (
                 "Прочитай весь текст на этой картинке/инфографике и подробно перескажи суть "
                 "в твоем фирменном саркастичном стиле!"
             )
 
-            current_time_str = datetime.datetime.now().strftime("%d.%m.%Y (%A), %H:%M")
-            vision_system_prompt = f"ТЕКУЩЕЕ ТОЧНОЕ ВРЕМЯ И ДАТА: {current_time_str}.\n{chat_custom_instructions[chat_id]}"
-
-            vision_messages = [
-                {"role": "system", "content": vision_system_prompt},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt_text},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_image}"
-                            }
-                        }
-                    ]
-                }
-            ]
-
-            attempt = 1
-            while not reply_text:
-                for model_name in VISION_MODELS:
-                    try:
-                        response = await asyncio.to_thread(
-                            groq_client.chat.completions.create,
-                            model=model_name,
-                            messages=vision_messages,
-                            max_tokens=1300
-                        )
-                        if response.choices and response.choices[0].message.content:
-                            reply_text = response.choices[0].message.content
-                            break
-                    except Exception as api_err:
-                        logging.warning(f"Попытка фото {attempt}: модель {model_name} занята ({api_err}), ждем...")
-
-                if not reply_text:
-                    attempt += 1
-                    await asyncio.sleep(5)
-
+            reply_text = await ask_vision_with_retry(chat_id, prompt_text, base64_image)
         except Exception as e:
             logging.error(f"Критическая ошибка обработки фото: {e}")
             reply_text = f"Ошибка обработки фото: {e}"
